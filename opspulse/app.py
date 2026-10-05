@@ -182,8 +182,7 @@ def _table(frame, *, rates=()):
     for column in display.columns:
         if pd.api.types.is_datetime64_any_dtype(display[column]):
             display[column] = display[column].dt.strftime("%Y-%m-%d")
-        elif display[column].dtype == "object":
-            display[column] = display[column].map(lambda x: "N/A" if x is None or (isinstance(x, float) and pd.isna(x)) else x)
+    display = display.astype(object).where(pd.notna(display), "N/A")
     return Markup(display.to_html(index=False, escape=True, border=0, classes="data-table"))
 
 
@@ -255,9 +254,12 @@ def _render_dashboard(raw, source, messages=None, reset_filters=False):
         overdue_chart = _chart(fig, include_js=not (throughput_chart or priority_chart))
 
     weekly_display = kpis["weekly"].copy()
-    for column in ("on_time_rate", "rework_rate", "on_time_rate_wow", "rework_rate_wow"):
+    for column in ("on_time_rate", "rework_rate"):
         if column in weekly_display:
             weekly_display[column] = weekly_display[column].map(lambda value: f"{value:.1%}" if pd.notna(value) else "N/A")
+    for column in ("on_time_rate_wow", "rework_rate_wow"):
+        if column in weekly_display:
+            weekly_display[column] = weekly_display[column].map(lambda value: f"{value * 100:+.1f} pts" if pd.notna(value) else "N/A")
     issue_frame = pd.DataFrame({"Issue": list(quality["issue_counts"]), "Flagged rows": list(quality["issue_counts"].values())})
     dataset_id = session.get("dataset_id", "")
     return render_template_string(

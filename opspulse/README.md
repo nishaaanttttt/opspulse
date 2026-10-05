@@ -11,9 +11,10 @@ A small weekly operations reporting tool for messy task tracker exports. Manual 
 
 ## Demo
 
-- Dashboard screenshot: `docs/dashboard-screenshot.png` (placeholder)
-- Short GIF: `docs/opspulse-demo.gif` (placeholder)
+- [Live OpsPulse app](https://opspulse-o146.onrender.com)
 - Sample input: `data/sample_tasks.csv`
+
+The free Render instance may take 50 seconds or more to wake after inactivity.
 
 ## How to run
 
@@ -53,8 +54,8 @@ Measured with `python benchmark.py` after dependencies were installed in the pro
 
 | Input | Cleaned rows | PDF size | Runtime |
 |---|---:|---:|---:|
-| Generated sample | 1,202 | 24,796 bytes | 1.475 seconds |
-| Generated 10× sample | 12,021 | 26,606 bytes | 5.912 seconds |
+| Generated sample | 1,202 | 24,796 bytes | 1.685 seconds |
+| Generated 10× sample | 12,021 | 26,606 bytes | 6.223 seconds |
 
 ## Data cleaning rules
 
@@ -72,7 +73,7 @@ Rule-based summaries are free, repeatable, private, and traceable to displayed n
 
 ## Limitations
 
-All included records are synthetic; they demonstrate patterns, not real operational performance. Uploads need the exact column names above. Ambiguous dates such as `04/03/2026` are read as day/month/year. There are no live tracker integrations, accounts, database, or cloud services. Weekly backlog is reconstructed from available dates, not a historical snapshot captured at that week.
+All included records are synthetic; they demonstrate patterns, not real operational performance. Uploads need the exact column names above. Ambiguous dates such as `04/03/2026` are read as day/month/year. There are no live tracker integrations, accounts, or database. The portfolio demo is hosted as a free Render service. Weekly backlog is reconstructed from available dates, not a historical snapshot captured at that week.
 
 ## Future improvements
 

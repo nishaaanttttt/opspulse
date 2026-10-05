@@ -2,6 +2,10 @@
 
 A weekly operations reporting tool that cleans task exports, calculates delivery KPIs, and creates a one-page PDF. All included data is synthetic.
 
+## Live demo
+
+[Open OpsPulse](https://opspulse-o146.onrender.com). The free Render service may take 50 seconds or more to wake after inactivity.
+
 ## Project files
 
 - [Full README, setup instructions, and KPI definitions](opspulse/README.md)
