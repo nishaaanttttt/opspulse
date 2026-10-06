@@ -5,7 +5,7 @@ import pandas as pd
 
 def generate(n=1200, seed=42):
     """Build 12 weeks of synthetic tasks with measured patterns and export defects."""
-    rng=np.random.default_rng(seed); start=pd.Timestamp('2026-01-05')
+    rng=np.random.default_rng(seed); start=pd.Timestamp('2026-01-05'); period_end=start+pd.Timedelta(days=12*7-1)
     owners=['Priya S.','Marco L.','Amina K.','Theo R.','Jules M.','Sam N.']; teams=['Operations','Customer Success','Implementation']; clients=['Northstar Labs','Cedar & Finch','Blue Orbit','Juniper Works']; records=[]
     for i in range(n):
         week=int(rng.integers(0,12)); created=start+pd.Timedelta(days=week*7+int(rng.integers(0,7))); priority=str(rng.choice(['High','Medium','Low'],p=[.35,.45,.20]))
@@ -13,6 +13,7 @@ def generate(n=1200, seed=42):
         due=created+pd.Timedelta(days=int(rng.integers(1,9)))
         if done:
             late=bool(rng.random()<(.35 if priority=='High' else .18)); offset=int(rng.integers(1,4)) if late else int(rng.integers(-2 if priority=='High' else -3,1)); completed=due+pd.Timedelta(days=offset)
+            completed=min(completed,period_end)
         else:
             completed=pd.NaT; due=created+pd.Timedelta(days=int(rng.integers(1,7) if rng.random()<.06 else rng.integers(80,161)))
         owner=str(rng.choice(owners,p=[.42,.17,.14,.11,.09,.07])); owner=f'  {owner.lower()}  ' if rng.random()<.03 else owner; owner='' if rng.random()<.03 else owner

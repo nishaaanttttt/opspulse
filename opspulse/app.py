@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import tempfile
 import uuid
+from collections import OrderedDict
 from datetime import date
 from io import BytesIO
 from pathlib import Path
@@ -13,7 +14,7 @@ import plotly.express as px
 from flask import Flask, make_response, render_template_string, request, send_file, session
 from markupsafe import Markup
 
-from src.cleaning import clean_tasks
+from src.cleaning import REQUIRED_COLUMNS, clean_tasks
 from src.kpis import calculate_kpis
 from src.report import create_pdf
 from src.summary import generate_summary
@@ -22,6 +23,8 @@ from src.summary import generate_summary
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = Path(tempfile.gettempdir()) / "opspulse_flask_uploads"
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+CLEANED_DATA_CACHE = OrderedDict()
+MAX_CACHED_DATASETS = 5
 
 app = Flask(__name__)
 app.secret_key = os.environ.get("SECRET_KEY") or uuid.uuid4().hex
@@ -82,6 +85,7 @@ PAGE = r"""<!doctype html>
       <div class="actions">
         <button class="secondary" name="action" value="download_csv">Download cleaned CSV</button>
         <button name="action" value="download_pdf">Download one-page PDF</button>
+        <a class="button secondary" href="/template.csv">Download template CSV</a>
       </div>
     </form>
   </aside>
@@ -107,49 +111,124 @@ PAGE = r"""<!doctype html>
 </body></html>"""
 
 
-def _sample_data():
-    return pd.read_csv(BASE_DIR / "data" / "sample_tasks.csv"), "Synthetic sample data"
+def _remember_cleaned(dataset_id, cleaned, quality):
+    CLEANED_DATA_CACHE[dataset_id] = (cleaned, quality)
+    CLEANED_DATA_CACHE.move_to_end(dataset_id)
+    while len(CLEANED_DATA_CACHE) > MAX_CACHED_DATASETS:
+        CLEANED_DATA_CACHE.popitem(last=False)
+
+
+def _read_frame(path):
+    if path.suffix.lower() in {".xlsx", ".xls"}:
+        return pd.read_excel(path)
+    return pd.read_csv(path)
+
+
+def _cleaned_dataset(dataset_id="sample", extension=None):
+    if dataset_id in CLEANED_DATA_CACHE:
+        CLEANED_DATA_CACHE.move_to_end(dataset_id)
+        cleaned, quality = CLEANED_DATA_CACHE[dataset_id]
+        source = "Synthetic sample data" if dataset_id == "sample" else "Uploaded task file"
+        return cleaned, quality, source
+
+    if dataset_id == "sample":
+        raw = pd.read_csv(BASE_DIR / "data" / "sample_tasks.csv")
+        source = "Synthetic sample data"
+    else:
+        path = UPLOAD_DIR / f"{dataset_id}{extension or '.csv'}"
+        if not path.is_file():
+            raise FileNotFoundError("The saved upload is no longer available.")
+        raw = _read_frame(path)
+        source = "Uploaded task file"
+    cleaned, quality = clean_tasks(raw)
+    _remember_cleaned(dataset_id, cleaned, quality)
+    return cleaned, quality, source
 
 
 def _current_data():
     token = session.get("dataset_id")
-    extension = session.get("dataset_ext")
     if not token:
-        return _sample_data()
-    path = UPLOAD_DIR / f"{token}{extension or '.csv'}"
-    if not path.is_file():
-        session.pop("dataset_id", None)
-        return _sample_data()
-    try:
-        if path.suffix == ".xlsx":
-            return pd.read_excel(path), "Uploaded task file"
-        if path.suffix == ".xls":
-            return pd.read_excel(path), "Uploaded task file"
-        return pd.read_csv(path), "Uploaded task file"
-    except (ValueError, ImportError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
-        raise ValueError(f"Could not read the saved upload: {exc}") from exc
+        return _cleaned_dataset("sample")
+    return _cleaned_dataset(token, session.get("dataset_ext"))
 
 
-def _save_upload(upload):
-    name = (upload.filename or "").lower()
-    extension = Path(name).suffix
+def _validated_upload(upload):
+    filename = (upload.filename or "").strip()
+    extension = Path(filename).suffix.lower()
     if extension not in {".csv", ".xlsx", ".xls"}:
         raise ValueError("Choose a CSV or Excel file (.csv, .xlsx, or .xls).")
     payload = upload.read()
     if not payload:
         raise ValueError("The selected file is empty.")
+
     token = uuid.uuid4().hex
-    (UPLOAD_DIR / f"{token}{extension}").write_bytes(payload)
-    old_token, old_extension = session.get("dataset_id"), session.get("dataset_ext")
-    session["dataset_id"] = token
-    session["dataset_ext"] = extension
-    if old_token and old_extension:
-        (UPLOAD_DIR / f"{old_token}{old_extension}").unlink(missing_ok=True)
-    cutoff = pd.Timestamp.now().timestamp() - 24 * 60 * 60
-    for old_file in UPLOAD_DIR.iterdir():
-        if old_file.is_file() and old_file.stat().st_mtime < cutoff:
-            old_file.unlink(missing_ok=True)
-    return extension
+    path = UPLOAD_DIR / f"{token}{extension}"
+    try:
+        path.write_bytes(payload)
+        raw = _read_frame(path)
+        # Do not assign a dataset id or keep the upload until schema and values are checked.
+        cleaned, quality = clean_tasks(raw)
+    except Exception:
+        path.unlink(missing_ok=True)
+        CLEANED_DATA_CACHE.pop(token, None)
+        raise
+    return token, extension, cleaned, quality
+
+
+def _discard_active_upload():
+    token = session.pop("dataset_id", None)
+    extension = session.pop("dataset_ext", None)
+    CLEANED_DATA_CACHE.pop(token, None)
+    if token:
+        for suffix in {extension or ".csv", ".csv", ".xlsx", ".xls"}:
+            (UPLOAD_DIR / f"{token}{suffix}").unlink(missing_ok=True)
+
+
+def _default_report_date(cleaned):
+    created = cleaned["Created Date"].dropna()
+    if created.empty:
+        return date.today().isoformat()
+    latest_created = created.max().normalize()
+    sunday = latest_created + pd.Timedelta(days=6 - latest_created.weekday())
+    done_dates = cleaned.loc[cleaned["Status"].eq("Done"), "Completed Date"].dropna()
+    if not done_dates.empty:
+        sunday = min(sunday, done_dates.max().normalize())
+    return sunday.date().isoformat()
+
+
+def _request_dates(cleaned, messages, reset_filters=False):
+    defaults = {
+        "as_of": _default_report_date(cleaned),
+        "created_from": cleaned["Created Date"].min().date().isoformat() if cleaned["Created Date"].notna().any() else "",
+        "created_to": cleaned["Created Date"].max().date().isoformat() if cleaned["Created Date"].notna().any() else "",
+    }
+    values = {}
+    invalid = False
+    for field, default in defaults.items():
+        submitted = request.form.get(field) if request.method == "POST" else None
+        if submitted in (None, ""):
+            values[field] = default
+            continue
+        try:
+            parsed = date.fromisoformat(submitted.strip()).isoformat()
+            values[field] = default if reset_filters else parsed
+        except (AttributeError, TypeError, ValueError):
+            values[field] = default
+            invalid = True
+    if invalid:
+        messages.append("One or more dates were invalid; default dates were used.")
+    return values
+
+
+def _failure_message(exc, *, uploaded=False):
+    message = str(exc)
+    prefix = "Missing required columns:"
+    if message.startswith(prefix):
+        missing = message[len(prefix):].strip()
+        return f"Upload is missing required columns: {missing}. Showing sample data."
+    if uploaded and isinstance(exc, ValueError):
+        return f"Could not use this upload: {message} Showing sample data."
+    return f"Could not read the saved upload: {message} Showing sample data."
 
 
 def _metric(label, value, delta, kind="number"):
@@ -190,17 +269,10 @@ def _chart(fig, include_js=False):
     return fig.to_html(full_html=False, include_plotlyjs="cdn" if include_js else False, config={"responsive": True, "displayModeBar": False})
 
 
-def _render_dashboard(raw, source, messages=None, reset_filters=False):
-    cleaned, quality = clean_tasks(raw)
-    done_dates = cleaned.loc[cleaned["Status"].eq("Done"), "Completed Date"].dropna()
-    default_as_of = done_dates.max().date() if len(done_dates) else date.today()
-    dates = cleaned["Created Date"].dropna()
-    default_from = dates.min().date().isoformat() if len(dates) else ""
-    default_to = dates.max().date().isoformat() if len(dates) else ""
-
-    as_of = (None if reset_filters else request.form.get("as_of")) or default_as_of.isoformat()
-    created_from = default_from if reset_filters else request.form.get("created_from", default_from)
-    created_to = default_to if reset_filters else request.form.get("created_to", default_to)
+def _render_dashboard(cleaned, quality, source, messages, dates, reset_filters=False, filtered=None, kpis=None, summary=None):
+    as_of = dates["as_of"]
+    created_from = dates["created_from"]
+    created_to = dates["created_to"]
     all_teams = sorted(cleaned["Team"].dropna().astype(str).unique().tolist())
     all_owners = sorted(cleaned["Owner"].dropna().astype(str).unique().tolist())
     priority_order = {"High": 0, "Medium": 1, "Low": 2}
@@ -213,19 +285,21 @@ def _render_dashboard(raw, source, messages=None, reset_filters=False):
     else:
         selected_teams, selected_owners, selected_priorities = all_teams, all_owners, all_priorities
 
-    filtered = cleaned.copy()
-    if created_from:
-        filtered = filtered[filtered["Created Date"].ge(pd.Timestamp(created_from))]
-    if created_to:
-        filtered = filtered[filtered["Created Date"].le(pd.Timestamp(created_to))]
-    filtered = filtered[
-        filtered["Team"].astype(str).isin(selected_teams)
-        & filtered["Owner"].astype(str).isin(selected_owners)
-        & filtered["Priority"].astype(str).isin(selected_priorities)
-    ]
-
-    kpis = calculate_kpis(filtered, as_of_date=as_of)
-    summary = generate_summary(kpis)
+    if filtered is None:
+        filtered = cleaned.copy()
+        if created_from:
+            filtered = filtered[filtered["Created Date"].ge(pd.Timestamp(created_from))]
+        if created_to:
+            filtered = filtered[filtered["Created Date"].le(pd.Timestamp(created_to))]
+        filtered = filtered[
+            filtered["Team"].astype(str).isin(selected_teams)
+            & filtered["Owner"].astype(str).isin(selected_owners)
+            & filtered["Priority"].astype(str).isin(selected_priorities)
+        ]
+    if kpis is None:
+        kpis = calculate_kpis(filtered, as_of_date=as_of)
+    if summary is None:
+        summary = generate_summary(kpis)
     overall = kpis["overall"]
     metrics = [
         _metric("On-time", overall.get("on_time_rate"), kpis["wow"].get("on_time_rate"), "rate"),
@@ -294,54 +368,69 @@ def dashboard():
     reset_filters = False
     action = request.form.get("action", "") if request.method == "POST" else ""
     if action == "use_sample":
-        token = session.pop("dataset_id", None)
-        extension = session.pop("dataset_ext", None)
-        if token and extension:
-            (UPLOAD_DIR / f"{token}{extension}").unlink(missing_ok=True)
-        raw, source = _sample_data()
-        return _render_dashboard(raw, source, messages, reset_filters=True)
+        _discard_active_upload()
+        reset_filters = True
 
-    upload = request.files.get("task_file") if request.method == "POST" else None
-    try:
-        if upload and upload.filename:
-            extension = _save_upload(upload)
-            raw, source = _current_data()
-            messages.append("File uploaded and cleaned. Review the filters and report below.")
+    upload = request.files.get("task_file") if request.method == "POST" and action != "use_sample" else None
+    if upload and upload.filename:
+        try:
+            token, extension, cleaned, quality = _validated_upload(upload)
+            old_token, old_extension = session.get("dataset_id"), session.get("dataset_ext")
+            _remember_cleaned(token, cleaned, quality)
+            session["dataset_id"] = token
+            session["dataset_ext"] = extension
+            if old_token:
+                CLEANED_DATA_CACHE.pop(old_token, None)
+                for suffix in {old_extension or ".csv", ".csv", ".xlsx", ".xls"}:
+                    (UPLOAD_DIR / f"{old_token}{suffix}").unlink(missing_ok=True)
+            messages.append("File uploaded and validated. Review the filters and report below.")
+            source = "Uploaded task file"
             reset_filters = True
-        else:
-            raw, source = _current_data()
-            reset_filters = False
-    except (ValueError, ImportError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
-        messages.append(f"Could not load this file: {exc}")
-        raw, source = _sample_data()
-        session.pop("dataset_id", None)
-        session.pop("dataset_ext", None)
-        return _render_dashboard(raw, source, messages, reset_filters=True)
+        except Exception as exc:
+            _discard_active_upload()
+            messages.append(_failure_message(exc, uploaded=True))
+            cleaned, quality, source = _cleaned_dataset("sample")
+            reset_filters = True
+    elif action == "use_sample":
+        cleaned, quality, source = _cleaned_dataset("sample")
+    else:
+        try:
+            cleaned, quality, source = _current_data()
+        except Exception as exc:
+            _discard_active_upload()
+            messages.append(_failure_message(exc))
+            cleaned, quality, source = _cleaned_dataset("sample")
+            reset_filters = True
 
-    try:
-        if action == "download_pdf":
-            cleaned, quality = clean_tasks(raw)
-            # Apply the same active form selections as the dashboard render.
-            as_of = request.form.get("as_of") or None
-            from_date, to_date = request.form.get("created_from"), request.form.get("created_to")
-            if from_date:
-                cleaned = cleaned[cleaned["Created Date"].ge(pd.Timestamp(from_date))]
-            if to_date:
-                cleaned = cleaned[cleaned["Created Date"].le(pd.Timestamp(to_date))]
-            for field, column in (("teams", "Team"), ("owners", "Owner"), ("priorities", "Priority")):
-                selected = request.form.getlist(field)
-                cleaned = cleaned[cleaned[column].astype(str).isin(selected)]
-            kpis = calculate_kpis(cleaned, as_of_date=as_of)
-            pdf = create_pdf(kpis, generate_summary(kpis), quality)
-            return send_file(BytesIO(pdf), mimetype="application/pdf", as_attachment=True, download_name="opspulse_weekly_report.pdf")
-        if action == "download_csv":
-            cleaned, _ = clean_tasks(raw)
-            output = BytesIO(cleaned.to_csv(index=False).encode("utf-8"))
-            return send_file(output, mimetype="text/csv", as_attachment=True, download_name="opspulse_cleaned.csv")
-    except (ValueError, ImportError, pd.errors.ParserError, pd.errors.EmptyDataError) as exc:
-        messages.append(f"Could not create the download: {exc}")
+    dates = _request_dates(cleaned, messages, reset_filters=reset_filters)
+    filtered = cleaned.copy()
+    if dates["created_from"]:
+        filtered = filtered[filtered["Created Date"].ge(pd.Timestamp(dates["created_from"]))]
+    if dates["created_to"]:
+        filtered = filtered[filtered["Created Date"].le(pd.Timestamp(dates["created_to"]))]
+    for field, column in (("teams", "Team"), ("owners", "Owner"), ("priorities", "Priority")):
+        selected = request.form.getlist(field) if request.method == "POST" and not reset_filters else cleaned[column].dropna().astype(str).unique().tolist()
+        filtered = filtered[filtered[column].astype(str).isin(selected)]
 
-    return _render_dashboard(raw, source, messages, reset_filters=reset_filters)
+    if action == "download_csv":
+        output = BytesIO(cleaned.to_csv(index=False).encode("utf-8"))
+        return send_file(output, mimetype="text/csv", as_attachment=True, download_name="opspulse_cleaned.csv")
+    kpis = calculate_kpis(filtered, as_of_date=dates["as_of"])
+    summary = generate_summary(kpis)
+    if action == "download_pdf":
+        pdf = create_pdf(kpis, summary, quality)
+        return send_file(BytesIO(pdf), mimetype="application/pdf", as_attachment=True, download_name="opspulse_weekly_report.pdf")
+
+    return _render_dashboard(cleaned, quality, source, messages, dates, reset_filters=reset_filters, filtered=filtered, kpis=kpis, summary=summary)
+
+
+@app.get("/template.csv")
+def download_template():
+    examples = pd.DataFrame([
+        ["DEMO-001", "2026-01-05", "2026-01-09", "2026-01-08", "Alex Example", "Operations", "High", "Done", "Fictional Project A", 4, 3, "No"],
+        ["DEMO-002", "2026-01-06", "2026-01-13", "", "Jamie Example", "Customer Success", "Medium", "In Progress", "Fictional Project B", 6, 2, "No"],
+    ], columns=REQUIRED_COLUMNS)
+    return send_file(BytesIO(examples.to_csv(index=False).encode("utf-8")), mimetype="text/csv", as_attachment=True, download_name="opspulse_template.csv")
 
 
 @app.errorhandler(413)

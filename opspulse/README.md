@@ -28,7 +28,16 @@ python app.py
 
 The app opens at `http://127.0.0.1:5000` with sample data. Use the sidebar to upload `.csv`, `.xlsx`, or `.xls` files and adjust the report date and filters. Expected columns: `Task ID`, `Created Date`, `Due Date`, `Completed Date`, `Owner`, `Team`, `Priority`, `Status`, `Client/Project`, `Estimated Hours`, `Actual Hours`, and `Rework`.
 
-For a production web server, run `gunicorn app:app --bind 0.0.0.0:$PORT` from this directory. On Render, set the project root directory to `opspulse`, the build command to `pip install -r requirements.txt`, and the start command to the Gunicorn command above.
+## Deploy on Render
+
+Create a web service from the GitHub repository with these settings:
+
+- Root directory: `opspulse`
+- Build command: `pip install -r requirements.txt`
+- Start command: `gunicorn --workers 1 --bind 0.0.0.0:$PORT app:app`
+- Environment variables: `PYTHON_VERSION=3.12` and `SECRET_KEY` set to a long, randomly generated value
+
+On the free tier, the first load after inactivity can take about 50 seconds while the service wakes.
 
 Regenerate sample data with `python data/generate_sample.py`; run tests with `pytest`; measure the full pipeline with `python benchmark.py`.
 
